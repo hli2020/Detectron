@@ -1,0 +1,65 @@
+https://caffe2.ai/docs/getting-started.html?platform=mac&configuration=compile#custom-anaconda-install
+
+
+Install cuda with driver:
+https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&target_distro=Ubuntu&target_version=1604&target_type=debnetwork
+
+Installation Instructions:
+$ sudo dpkg -i cuda-repo-ubuntu1604_9.1.85-1_amd64.deb
+$ sudo apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1604/x86_64/7fa2af80.pub
+$ sudo apt-get update
+$ sudo apt-get install cuda
+
+
+Install cudnn first (with the driver also)!
+$ sudo cp cuda/include/cudnn.h /usr/local/cuda/include
+$ sudo cp cuda/lib64/libcudnn* /usr/local/cuda/lib64
+$ sudo chmod a+r /usr/local/cuda/include/cudnn.h \
+/usr/local/cuda/lib64/libcudnn*
+
+
+
+Read more at: http://docs.nvidia.com/deeplearning/sdk/cudnn-install/index.html#ixzz55To2QVd8 
+Follow us: @GPUComputing on Twitter | NVIDIA on Facebook
+
+
+# Create a conda environment (optional)
+conda create -n my_caffe2_env && source activate my_caffe2_env
+
+# Install required packages
+# mkl isn't actually required, but is really recommended for Anaconda
+conda install -y \
+    future \
+    glog \
+    lmdb \
+    mkl \
+    mkl-include \
+    numpy \
+    opencv \
+    protobuf \
+    snappy \
+    six
+
+# Clone Caffe2
+cd ~ && git clone --recursive https://github.com/caffe2/caffe2.git && cd caffe2
+
+# Make Caffe2 in a separate folder to avoid polluting the Caffe2 source tree.
+# This can be anywhere you want it
+mkdir build && cd build
+
+
+$ cmake -DUSE_CUDA=ON -DUSE_LEVELDB=ON -DUSE_NCCL=ON \
+-DUSE_NATIVE_ARCH=ON \
+-DCMAKE_PREFIX_PATH=~/anaconda3/envs/py27 -DCMAKE_INSTALL_PREFIX=~/anaconda3/envs/py27 ..
+
+$ sudo make install -j4 (not 8, since it crashes; takes SUPER long time to compile)
+
+
+## Run the detectron
+
+python tools/infer_simple.py \
+    --cfg configs/12_2017_baselines/e2e_mask_rcnn_R-101-FPN_2x.yaml \
+    --output-dir /tmp/detectron-visualizations \
+    --image-ext jpg \
+    --wts https://s3-us-west-2.amazonaws.com/detectron/35861858/12_2017_baselines/e2e_mask_rcnn_R-101-FPN_2x.yaml.02_32_51.SgT4y1cO/output/train/coco_2014_train:coco_2014_valminusminival/generalized_rcnn/model_final.pkl \
+    demo
