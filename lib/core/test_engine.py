@@ -32,6 +32,8 @@ from caffe2.python import workspace
 
 from core.config import cfg
 from core.config import get_output_dir
+from core.rpn_generator import generate_rpn_on_dataset
+from core.rpn_generator import generate_rpn_on_range
 from core.test import im_detect_all
 from datasets import task_evaluation
 from datasets.json_dataset import JsonDataset
@@ -47,19 +49,115 @@ import utils.vis as vis_utils
 logger = logging.getLogger(__name__)
 
 
-def test_net_on_dataset(multi_gpu=False):
+def get_eval_functions():
+    # Determine which parent or child function should handle inference
+    if cfg.MODEL.RPN_ONLY:
+        child_func = generate_rpn_on_range
+        parent_func = generate_rpn_on_dataset
+    else:
+        # Generic case that handles all network types other than RPN-only nets
+        # and RetinaNet
+        child_func = test_net
+        parent_func = test_net_on_dataset
+
+    return parent_func, child_func
+
+
+def get_inference_dataset(index, is_parent=True):
+    assert is_parent or len(cfg.TEST.DATASETS) == 1, \
+        'The child inference process can only work on a single dataset'
+
+    dataset_name = cfg.TEST.DATASETS[index]
+
+    if cfg.TEST.PRECOMPUTED_PROPOSALS:
+        assert is_parent or len(cfg.TEST.PROPOSAL_FILES) == 1, \
+            'The child inference process can only work on a single proposal file'
+        assert len(cfg.TEST.PROPOSAL_FILES) == len(cfg.TEST.DATASETS), \
+            'If proposals are used, one proposal file must be specified for ' \
+            'each dataset'
+        proposal_file = cfg.TEST.PROPOSAL_FILES[index]
+    else:
+        proposal_file = None
+
+    return dataset_name, proposal_file
+
+
+def run_inference(
+    weights_file, ind_range=None,
+    multi_gpu_testing=False, gpu_id=0,
+    check_expected_results=False,
+):
+    parent_func, child_func = get_eval_functions()
+    is_parent = ind_range is None
+
+    def result_getter():
+        if is_parent:
+            # Parent case:
+            # In this case we're either running inference on the entire dataset in a
+            # single process or (if multi_gpu_testing is True) using this process to
+            # launch subprocesses that each run inference on a range of the dataset
+            all_results = {}
+            for i in range(len(cfg.TEST.DATASETS)):
+                dataset_name, proposal_file = get_inference_dataset(i)
+                output_dir = get_output_dir(dataset_name, training=False)
+                results = parent_func(
+                    weights_file,
+                    dataset_name,
+                    proposal_file,
+                    output_dir,
+                    multi_gpu=multi_gpu_testing
+                )
+                all_results.update(results)
+
+            return all_results
+        else:
+            # Subprocess child case:
+            # In this case test_net was called via subprocess.Popen to execute on a
+            # range of inputs on a single dataset
+            dataset_name, proposal_file = get_inference_dataset(0, is_parent=False)
+            output_dir = get_output_dir(dataset_name, training=False)
+            return child_func(
+                weights_file,
+                dataset_name,
+                proposal_file,
+                output_dir,
+                ind_range=ind_range,
+                gpu_id=gpu_id
+            )
+
+    all_results = result_getter()
+    if check_expected_results and is_parent:
+        task_evaluation.check_expected_results(
+            all_results,
+            atol=cfg.EXPECTED_RESULTS_ATOL,
+            rtol=cfg.EXPECTED_RESULTS_RTOL
+        )
+        task_evaluation.log_copy_paste_friendly_results(all_results)
+
+    return all_results
+
+
+def test_net_on_dataset(
+    weights_file,
+    dataset_name,
+    proposal_file,
+    output_dir,
+    multi_gpu=False,
+    gpu_id=0
+):
     """Run inference on a dataset."""
-    output_dir = get_output_dir(training=False)
-    dataset = JsonDataset(cfg.TEST.DATASET)
+    dataset = JsonDataset(dataset_name)
     test_timer = Timer()
     test_timer.tic()
     if multi_gpu:
         num_images = len(dataset.get_roidb())
         all_boxes, all_segms, all_keyps = multi_gpu_test_net_on_dataset(
-            num_images, output_dir
+            weights_file, dataset_name, proposal_file, num_images, output_dir
         )
     else:
-        all_boxes, all_segms, all_keyps = test_net()
+        all_boxes, all_segms, all_keyps = test_net(
+            weights_file, dataset_name, proposal_file, output_dir, gpu_id=gpu_id
+        )
     test_timer.toc()
     logger.info('Total inference time: {:.3f}s'.format(test_timer.average_time))
     results = task_evaluation.evaluate_all(
@@ -68,18 +166,26 @@ def test_net_on_dataset(multi_gpu=False):
     return results
 
 
-def multi_gpu_test_net_on_dataset(num_images, output_dir):
+def multi_gpu_test_net_on_dataset(
+    weights_file, dataset_name, proposal_file, num_images, output_dir
+):
     """Multi-gpu inference on a dataset."""
     binary_dir = envu.get_runtime_dir()
     binary_ext = envu.get_py_bin_ext()
     binary = os.path.join(binary_dir, 'test_net' + binary_ext)
     assert os.path.exists(binary), 'Binary \'{}\' not found'.format(binary)
 
+    # Pass the target dataset and proposal file (if any) via the command line
+    opts = ['TEST.DATASETS', '("{}",)'.format(dataset_name)]
+    opts += ['TEST.WEIGHTS', weights_file]
+    if proposal_file:
+        opts += ['TEST.PROPOSAL_FILES', '("{}",)'.format(proposal_file)]
+
     # Run inference in parallel in subprocesses
     # Outputs will be a list of outputs from each subprocess, where the output
     # of each subprocess is the dictionary saved by test_net().
     outputs = subprocess_utils.process_in_parallel(
-        'detection', num_images, binary, output_dir
+        'detection', num_images, binary, output_dir, opts
     )
 
     # Collate the results from each subprocess
@@ -109,32 +215,30 @@ def multi_gpu_test_net_on_dataset(num_images, output_dir):
     return all_boxes, all_segms, all_keyps
 
 
-def test_net(ind_range=None):
+def test_net(
+    weights_file,
+    dataset_name,
+    proposal_file,
+    output_dir,
+    ind_range=None,
+    gpu_id=0
+):
     """Run inference on all images in a dataset or over an index range of images
     in a dataset using a single GPU.
     """
-    assert cfg.TEST.WEIGHTS != '', \
-        'TEST.WEIGHTS must be set to the model file to test'
     assert not cfg.MODEL.RPN_ONLY, \
         'Use rpn_generate to generate proposals from RPN-only models'
-    assert cfg.TEST.DATASET != '', \
-        'TEST.DATASET must be set to the dataset name to test'
 
-    output_dir = get_output_dir(training=False)
     roidb, dataset, start_ind, end_ind, total_num_images = get_roidb_and_dataset(
-        ind_range
+        dataset_name, proposal_file, ind_range
     )
-    model = initialize_model_from_cfg()
+    model = initialize_model_from_cfg(weights_file, gpu_id=gpu_id)
     num_images = len(roidb)
     num_classes = cfg.MODEL.NUM_CLASSES
     all_boxes, all_segms, all_keyps = empty_results(num_classes, num_images)
     timers = defaultdict(Timer)
     for i, entry in enumerate(roidb):
-        if cfg.MODEL.FASTER_RCNN:
-            # Faster R-CNN type models generate proposals on-the-fly with an
-            # in-network RPN
-            box_proposals = None
-        else:
+        if cfg.TEST.PRECOMPUTED_PROPOSALS:
             # The roidb may contain ground-truth rois (for example, if the roidb
             # comes from the training or val split). We only want to evaluate
             # detection on the *non*-ground-truth rois. We select only the rois
@@ -143,9 +247,13 @@ def test_net(ind_range=None):
             box_proposals = entry['boxes'][entry['gt_classes'] == 0]
             if len(box_proposals) == 0:
                 continue
+        else:
+            # Faster R-CNN type models generate proposals on-the-fly with an
+            # in-network RPN; 1-stage models don't require proposals.
+            box_proposals = None
 
         im = cv2.imread(entry['image'])
-        with c2_utils.NamedCudaScope(0):
+        with c2_utils.NamedCudaScope(gpu_id):
             cls_boxes_i, cls_segms_i, cls_keyps_i = im_detect_all(
                 model, im, box_proposals, timers
             )
@@ -213,13 +321,13 @@ def test_net(ind_range=None):
     return all_boxes, all_segms, all_keyps
 
 
-def initialize_model_from_cfg():
+def initialize_model_from_cfg(weights_file, gpu_id=0):
     """Initialize a model from the global cfg. Loads test-time weights and
     creates the networks in the Caffe2 workspace.
     """
-    model = model_builder.create(cfg.MODEL.TYPE, train=False)
-    net_utils.initialize_from_weights_file(
-        model, cfg.TEST.WEIGHTS, broadcast=False
+    model = model_builder.create(cfg.MODEL.TYPE, train=False, gpu_id=gpu_id)
+    net_utils.initialize_gpu_from_weights_file(
+        model, weights_file, gpu_id=gpu_id,
     )
     model_builder.add_inference_inputs(model)
     workspace.CreateNet(model.net)
@@ -231,18 +339,19 @@ def initialize_model_from_cfg():
     return model
 
 
-def get_roidb_and_dataset(ind_range):
+def get_roidb_and_dataset(dataset_name, proposal_file, ind_range):
     """Get the roidb for the dataset specified in the global cfg. Optionally
     restrict it to a range of indices if ind_range is a pair of integers.
     """
-    dataset = JsonDataset(cfg.TEST.DATASET)
-    if cfg.MODEL.FASTER_RCNN:
-        roidb = dataset.get_roidb()
-    else:
+    dataset = JsonDataset(dataset_name)
+    if cfg.TEST.PRECOMPUTED_PROPOSALS:
+        assert proposal_file, 'No proposal file given'
         roidb = dataset.get_roidb(
-            proposal_file=cfg.TEST.PROPOSAL_FILE,
+            proposal_file=proposal_file,
             proposal_limit=cfg.TEST.PROPOSAL_LIMIT
         )
+    else:
+        roidb = dataset.get_roidb()
 
     if ind_range is not None:
         total_num_images = len(roidb)
